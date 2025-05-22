@@ -1,0 +1,14 @@
+{
+    "compilerOptions": {
+      "outDir": "dist",            // Output folder for compiled files
+      "rootDir": "src",            // Root of input files
+      "module": "CommonJS",        // Or "ESNext" for ESM
+      "target": "ES2020",          // Or your preferred JS version
+      "declaration": true,         // Optional: generates .d.ts files
+      "strict": true,              // Optional: enable strict type-checking
+      "esModuleInterop": true,     // Needed for default imports from CommonJS
+      "skipLibCheck": true
+    },
+    "include": ["src"]
+  }
+  
