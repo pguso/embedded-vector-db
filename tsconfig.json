@@ -7,7 +7,9 @@
       "declaration": true,         // Optional: generates .d.ts files
       "strict": true,              // Optional: enable strict type-checking
       "esModuleInterop": true,     // Needed for default imports from CommonJS
-      "skipLibCheck": true
+      "skipLibCheck": true,
+      "declarationDir": "./dist",
+      "emitDeclarationOnly": false
     },
     "include": ["src"]
   }
