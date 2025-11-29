@@ -6,6 +6,8 @@ import * as path from 'path';
 interface VectorDBConfig {
     dim: number;
     maxElements: number;
+    autoCompaction?: boolean;  // Enable/disable auto-compaction
+    compactionInterval?: number;  // Interval in ms (default: 1 hour)
 }
 
 interface VectorEntry {
@@ -27,11 +29,16 @@ interface HybridSearchResult extends SearchResult {
 }
 
 interface HybridSearchOptions {
-    vectorWeight?: number;  // Weight for vector similarity (0-1)
-    textWeight?: number;    // Weight for text matching (0-1)
-    k?: number;             // Number of results
+    vectorWeight?: number;
+    textWeight?: number;
+    k?: number;
     metadataFilter?: Record<string, any>;
-    rerank?: boolean;       // Whether to rerank results
+    rerank?: boolean;
+}
+
+interface BM25Params {
+    k1?: number;  // Term frequency saturation (default: 1.5)
+    b?: number;   // Length normalization (default: 0.75)
 }
 
 interface NamespaceData {
@@ -45,17 +52,41 @@ interface NamespaceData {
     freeList: number[];
     fullTextIndex: Map<string, Set<number>>;
     indexedFields: string[];
+    // BM25 statistics
+    docLengths: Map<number, number>;  // Document lengths for BM25
+    avgDocLength: number;
+    totalDocs: number;
 }
 
 export class VectorDB {
     private readonly dim: number;
     private readonly maxElements: number;
     private readonly namespaces = new Map<string, NamespaceData>();
+    private compactionIntervalId: NodeJS.Timeout | null = null;
+    private readonly bm25Params: Required<BM25Params> = {
+        k1: 1.5,
+        b: 0.75
+    };
 
     constructor(config: VectorDBConfig) {
         this.dim = config.dim;
         this.maxElements = config.maxElements;
-        this.scheduleCompaction();
+
+        // Only schedule compaction if enabled (default: false to avoid hanging)
+        if (config.autoCompaction) {
+            this.scheduleCompaction(config.compactionInterval);
+        }
+    }
+
+    /**
+     * Clean up resources and stop background tasks
+     * Call this before your process exits
+     */
+    destroy(): void {
+        if (this.compactionIntervalId) {
+            clearInterval(this.compactionIntervalId);
+            this.compactionIntervalId = null;
+        }
     }
 
     private initializeNamespace(namespace: string): void {
@@ -74,6 +105,9 @@ export class VectorDB {
                 freeList: [],
                 fullTextIndex: new Map(),
                 indexedFields: [],
+                docLengths: new Map(),
+                avgDocLength: 0,
+                totalDocs: 0
             });
         }
     }
@@ -91,6 +125,40 @@ export class VectorDB {
             .filter(token => token.length > 0);
     }
 
+    /**
+     * Calculate document length (number of tokens) for BM25
+     */
+    private calculateDocLength(metadata: Record<string, any>, indexedFields: string[]): number {
+        let length = 0;
+        indexedFields.forEach(field => {
+            const value = metadata[field];
+            if (typeof value === 'string') {
+                const tokens = this.tokenizeText(value);
+                length += tokens.length;
+            }
+        });
+        return length;
+    }
+
+    /**
+     * Update BM25 statistics when documents are added/removed
+     */
+    private updateBM25Stats(nsData: NamespaceData): void {
+        if (nsData.docLengths.size === 0) {
+            nsData.avgDocLength = 0;
+            nsData.totalDocs = 0;
+            return;
+        }
+
+        let totalLength = 0;
+        nsData.docLengths.forEach(length => {
+            totalLength += length;
+        });
+
+        nsData.avgDocLength = totalLength / nsData.docLengths.size;
+        nsData.totalDocs = nsData.docLengths.size;
+    }
+
     private indexMetadata(nsData: NamespaceData, internalId: number, metadata: Record<string, any>): void {
         // Remove existing entries for this internalId
         nsData.fullTextIndex.forEach((ids, term) => {
@@ -101,6 +169,10 @@ export class VectorDB {
                 }
             }
         });
+
+        // Calculate and store document length for BM25
+        const docLength = this.calculateDocLength(metadata, nsData.indexedFields);
+        nsData.docLengths.set(internalId, docLength);
 
         // Index new metadata
         nsData.indexedFields.forEach(field => {
@@ -115,6 +187,9 @@ export class VectorDB {
                 });
             }
         });
+
+        // Update BM25 statistics
+        this.updateBM25Stats(nsData);
     }
 
     private async withReadLock<T>(namespace: string, operation: (nsData: NamespaceData) => Promise<T>): Promise<T> {
@@ -162,6 +237,16 @@ export class VectorDB {
         await this.withWriteLock(namespace, async (nsData) => {
             nsData.indexedFields = fields;
         });
+    }
+
+    /**
+     * Set BM25 parameters for tuning text search
+     * @param k1 - Term frequency saturation parameter (default: 1.5, range: 1.2-2.0)
+     * @param b - Length normalization parameter (default: 0.75, range: 0-1)
+     */
+    setBM25Params(k1: number = 1.5, b: number = 0.75): void {
+        this.bm25Params.k1 = k1;
+        this.bm25Params.b = b;
     }
 
     async insert(namespace: string, id: string, vector: number[], metadata: Record<string, any> = {}): Promise<void> {
@@ -234,6 +319,7 @@ export class VectorDB {
                 delete nsData.idMap[id];
                 nsData.revMap.delete(internalId);
                 nsData.freeList.push(internalId);
+                nsData.docLengths.delete(internalId);
 
                 // Remove from full-text index
                 nsData.fullTextIndex.forEach((ids, term) => {
@@ -244,6 +330,9 @@ export class VectorDB {
                         }
                     }
                 });
+
+                // Update BM25 statistics
+                this.updateBM25Stats(nsData);
             }
         });
     }
@@ -280,6 +369,42 @@ export class VectorDB {
         });
     }
 
+    /**
+     * Calculate BM25 score for a document
+     * @param termFreq - Map of term to its frequency in the document
+     * @param docLength - Length of the document
+     * @param nsData - Namespace data containing BM25 statistics
+     * @returns BM25 score
+     */
+    private calculateBM25Score(
+        termFreq: Map<string, number>,
+        docLength: number,
+        nsData: NamespaceData
+    ): number {
+        const { k1, b } = this.bm25Params;
+        const N = nsData.totalDocs;
+        let score = 0;
+
+        termFreq.forEach((tf, term) => {
+            const termDocs = nsData.fullTextIndex.get(term);
+            if (!termDocs) return;
+
+            const df = termDocs.size;  // Document frequency
+            const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);  // IDF formula
+
+            // BM25 formula
+            const numerator = tf * (k1 + 1);
+            const denominator = tf + k1 * (1 - b + b * (docLength / nsData.avgDocLength));
+
+            score += idf * (numerator / denominator);
+        });
+
+        return score;
+    }
+
+    /**
+     * Full-text search using BM25 scoring
+     */
     async fullTextSearch(
         namespace: string,
         query: string,
@@ -289,20 +414,57 @@ export class VectorDB {
         return this.withReadLock(namespace, async (nsData) => {
             if (nsData.indexedFields.length === 0) return [];
 
-            const tokens = this.tokenizeText(query);
-            if (tokens.length === 0) return [];
+            const queryTokens = this.tokenizeText(query);
+            if (queryTokens.length === 0) return [];
 
-            const internalIds = new Map<number, number>();
-            tokens.forEach(token => {
-                const ids = nsData.fullTextIndex.get(token);
-                ids?.forEach(id => {
-                    internalIds.set(id, (internalIds.get(id) || 0) + 1);
+            // Build term frequency for query
+            const queryTermFreq = new Map<string, number>();
+            queryTokens.forEach(token => {
+                queryTermFreq.set(token, (queryTermFreq.get(token) || 0) + 1);
+            });
+
+            // Calculate BM25 scores for all matching documents
+            const docScores = new Map<number, number>();
+
+            queryTermFreq.forEach((_, term) => {
+                const matchingDocs = nsData.fullTextIndex.get(term);
+                if (!matchingDocs) return;
+
+                matchingDocs.forEach(internalId => {
+                    if (!docScores.has(internalId)) {
+                        docScores.set(internalId, 0);
+                    }
                 });
             });
 
-            return Array.from(internalIds.entries())
+            // Calculate BM25 score for each matching document
+            docScores.forEach((_, internalId) => {
+                const entry = nsData.revMap.get(internalId);
+                if (!entry) return;
+
+                // Get document term frequencies
+                const docTermFreq = new Map<string, number>();
+                nsData.indexedFields.forEach(field => {
+                    const value = entry.metadata[field];
+                    if (typeof value === 'string') {
+                        const tokens = this.tokenizeText(value);
+                        tokens.forEach(token => {
+                            if (queryTermFreq.has(token)) {
+                                docTermFreq.set(token, (docTermFreq.get(token) || 0) + 1);
+                            }
+                        });
+                    }
+                });
+
+                const docLength = nsData.docLengths.get(internalId) || 0;
+                const bm25Score = this.calculateBM25Score(docTermFreq, docLength, nsData);
+                docScores.set(internalId, bm25Score);
+            });
+
+            // Sort by BM25 score and apply filters
+            return Array.from(docScores.entries())
                 .sort((a, b) => b[1] - a[1])
-                .map(([internalId]) => {
+                .map(([internalId, score]) => {
                     const entry = nsData.revMap.get(internalId);
                     if (!entry) return null;
 
@@ -311,7 +473,7 @@ export class VectorDB {
 
                     return matchesFilter ? {
                         id: entry.publicId,
-                        similarity: internalIds.get(internalId)! / tokens.length,
+                        similarity: score,  // BM25 score (not normalized)
                         metadata: entry.metadata
                     } : null;
                 })
@@ -321,28 +483,7 @@ export class VectorDB {
     }
 
     /**
-     * Perform hybrid search combining vector similarity and full-text keyword matching
-     *
-     * @param namespace - The namespace to search in
-     * @param queryVector - The embedding vector for semantic search
-     * @param queryText - The text query for keyword search
-     * @param options - Hybrid search configuration options
-     * @returns Array of hybrid search results with both vector and text scores
-     *
-     * @example
-     * ```typescript
-     * const results = await vectorDB.hybridSearch(
-     *   'documents',
-     *   queryEmbedding,
-     *   'machine learning algorithms',
-     *   {
-     *     vectorWeight: 0.7,  // 70% weight on semantic similarity
-     *     textWeight: 0.3,    // 30% weight on keyword matching
-     *     k: 10,
-     *     rerank: true
-     *   }
-     * );
-     * ```
+     * Perform hybrid search combining vector similarity and BM25 text search
      */
     async hybridSearch(
         namespace: string,
@@ -358,74 +499,10 @@ export class VectorDB {
             rerank = false
         } = options;
 
-        // Validate weights
         if (vectorWeight + textWeight !== 1.0) {
             throw new Error('vectorWeight and textWeight must sum to 1.0');
         }
 
-        return this.withReadLock(namespace, async (nsData) => {
-            if (nsData.revMap.size === 0) return [];
-
-            // Perform both searches with larger k to ensure good coverage
-            const searchK = Math.min(k * 3, nsData.revMap.size);
-
-            // 1. Vector search
-            const vectorResults = await this.performVectorSearch(
-                nsData,
-                queryVector,
-                searchK,
-                metadataFilter
-            );
-
-            // 2. Full-text search
-            const textResults = await this.performTextSearch(
-                nsData,
-                queryText,
-                searchK,
-                metadataFilter
-            );
-
-            // 3. Combine results
-            const combinedScores = this.combineSearchResults(
-                vectorResults,
-                textResults,
-                vectorWeight,
-                textWeight
-            );
-
-            // 4. Sort by combined score
-            let sortedResults = Array.from(combinedScores.values())
-                .sort((a, b) => b.combinedScore - a.combinedScore);
-
-            // 5. Optional reranking (useful for fine-tuning results)
-            if (rerank) {
-                sortedResults = this.rerankResults(sortedResults, queryVector, nsData);
-            }
-
-            return sortedResults.slice(0, k);
-        });
-    }
-
-    /**
-     * Reciprocal Rank Fusion (RRF) - an alternative hybrid search method
-     * that doesn't require tuning weights
-     *
-     * @param namespace - The namespace to search in
-     * @param queryVector - The embedding vector for semantic search
-     * @param queryText - The text query for keyword search
-     * @param k - Number of results to return
-     * @param rrf_k - RRF constant (default: 60, as per literature)
-     * @param metadataFilter
-     * @returns Array of hybrid search results using RRF scoring
-     */
-    async hybridSearchRRF(
-        namespace: string,
-        queryVector: number[],
-        queryText: string,
-        k: number = 5,
-        rrf_k: number = 60,
-        metadataFilter: Record<string, any> = {}
-    ): Promise<HybridSearchResult[]> {
         return this.withReadLock(namespace, async (nsData) => {
             if (nsData.revMap.size === 0) return [];
 
@@ -446,7 +523,55 @@ export class VectorDB {
                 metadataFilter
             );
 
-            // Apply Reciprocal Rank Fusion
+            // Combine results
+            const combinedScores = this.combineSearchResults(
+                vectorResults,
+                textResults,
+                vectorWeight,
+                textWeight
+            );
+
+            let sortedResults = Array.from(combinedScores.values())
+                .sort((a, b) => b.combinedScore - a.combinedScore);
+
+            if (rerank) {
+                sortedResults = this.rerankResults(sortedResults, queryVector, nsData);
+            }
+
+            return sortedResults.slice(0, k);
+        });
+    }
+
+    /**
+     * Reciprocal Rank Fusion (RRF) hybrid search
+     */
+    async hybridSearchRRF(
+        namespace: string,
+        queryVector: number[],
+        queryText: string,
+        k: number = 5,
+        rrf_k: number = 60,
+        metadataFilter: Record<string, any> = {}
+    ): Promise<HybridSearchResult[]> {
+        return this.withReadLock(namespace, async (nsData) => {
+            if (nsData.revMap.size === 0) return [];
+
+            const searchK = Math.min(k * 3, nsData.revMap.size);
+
+            const vectorResults = await this.performVectorSearch(
+                nsData,
+                queryVector,
+                searchK,
+                metadataFilter
+            );
+
+            const textResults = await this.performTextSearch(
+                nsData,
+                queryText,
+                searchK,
+                metadataFilter
+            );
+
             const rrfScores = new Map<string, {
                 id: string;
                 combinedScore: number;
@@ -457,7 +582,6 @@ export class VectorDB {
                 metadata: Record<string, any>;
             }>();
 
-            // Add vector results with RRF scoring
             vectorResults.forEach((result, rank) => {
                 const rrfScore = 1 / (rrf_k + rank + 1);
                 rrfScores.set(result.id, {
@@ -471,7 +595,6 @@ export class VectorDB {
                 });
             });
 
-            // Add text results with RRF scoring
             textResults.forEach((result, rank) => {
                 const rrfScore = 1 / (rrf_k + rank + 1);
                 const existing = rrfScores.get(result.id);
@@ -493,7 +616,6 @@ export class VectorDB {
                 }
             });
 
-            // Sort by RRF score and return top k
             return Array.from(rrfScores.values())
                 .sort((a, b) => b.combinedScore - a.combinedScore)
                 .slice(0, k)
@@ -546,20 +668,51 @@ export class VectorDB {
     ): Promise<SearchResult[]> {
         if (nsData.indexedFields.length === 0 || !queryText) return [];
 
-        const tokens = this.tokenizeText(queryText);
-        if (tokens.length === 0) return [];
+        const queryTokens = this.tokenizeText(queryText);
+        if (queryTokens.length === 0) return [];
 
-        const internalIds = new Map<number, number>();
-        tokens.forEach(token => {
-            const ids = nsData.fullTextIndex.get(token);
-            ids?.forEach(id => {
-                internalIds.set(id, (internalIds.get(id) || 0) + 1);
+        const queryTermFreq = new Map<string, number>();
+        queryTokens.forEach(token => {
+            queryTermFreq.set(token, (queryTermFreq.get(token) || 0) + 1);
+        });
+
+        const docScores = new Map<number, number>();
+
+        queryTermFreq.forEach((_, term) => {
+            const matchingDocs = nsData.fullTextIndex.get(term);
+            if (!matchingDocs) return;
+            matchingDocs.forEach(internalId => {
+                if (!docScores.has(internalId)) {
+                    docScores.set(internalId, 0);
+                }
             });
         });
 
-        return Array.from(internalIds.entries())
+        docScores.forEach((_, internalId) => {
+            const entry = nsData.revMap.get(internalId);
+            if (!entry) return;
+
+            const docTermFreq = new Map<string, number>();
+            nsData.indexedFields.forEach(field => {
+                const value = entry.metadata[field];
+                if (typeof value === 'string') {
+                    const tokens = this.tokenizeText(value);
+                    tokens.forEach(token => {
+                        if (queryTermFreq.has(token)) {
+                            docTermFreq.set(token, (docTermFreq.get(token) || 0) + 1);
+                        }
+                    });
+                }
+            });
+
+            const docLength = nsData.docLengths.get(internalId) || 0;
+            const bm25Score = this.calculateBM25Score(docTermFreq, docLength, nsData);
+            docScores.set(internalId, bm25Score);
+        });
+
+        return Array.from(docScores.entries())
             .sort((a, b) => b[1] - a[1])
-            .map(([internalId, matchCount]) => {
+            .map(([internalId, score]) => {
                 const entry = nsData.revMap.get(internalId);
                 if (!entry) return null;
 
@@ -568,7 +721,7 @@ export class VectorDB {
 
                 return matchesFilter ? {
                     id: entry.publicId,
-                    similarity: matchCount / tokens.length,
+                    similarity: score,
                     metadata: entry.metadata
                 } : null;
             })
@@ -584,7 +737,6 @@ export class VectorDB {
     ): Map<string, HybridSearchResult> {
         const combinedScores = new Map<string, HybridSearchResult>();
 
-        // Normalize scores to [0, 1] range
         const normalizeScores = (results: SearchResult[]) => {
             if (results.length === 0) return [];
             const maxScore = Math.max(...results.map(r => r.similarity));
@@ -600,7 +752,6 @@ export class VectorDB {
         const normalizedVector = normalizeScores(vectorResults);
         const normalizedText = normalizeScores(textResults);
 
-        // Add vector results
         normalizedVector.forEach(result => {
             combinedScores.set(result.id, {
                 id: result.id,
@@ -612,7 +763,6 @@ export class VectorDB {
             });
         });
 
-        // Add text results
         normalizedText.forEach(result => {
             const existing = combinedScores.get(result.id);
             if (existing) {
@@ -638,14 +788,12 @@ export class VectorDB {
         queryVector: number[],
         nsData: NamespaceData
     ): HybridSearchResult[] {
-        // Apply diversity-aware reranking (Maximal Marginal Relevance)
-        const lambda = 0.7; // Balance between relevance and diversity
+        const lambda = 0.7;
         const reranked: HybridSearchResult[] = [];
         const remaining = [...results];
 
         if (remaining.length === 0) return [];
 
-        // Start with the highest scoring document
         reranked.push(remaining.shift()!);
 
         while (remaining.length > 0) {
@@ -656,7 +804,6 @@ export class VectorDB {
                 const candidateEntry = nsData.revMap.get(nsData.idMap[candidate.id]);
                 if (!candidateEntry) return;
 
-                // Calculate max similarity with already selected documents
                 let maxSimilarity = 0;
                 for (const selected of reranked) {
                     const selectedEntry = nsData.revMap.get(nsData.idMap[selected.id]);
@@ -669,7 +816,6 @@ export class VectorDB {
                     }
                 }
 
-                // MMR score: balance relevance and diversity
                 const mmrScore = lambda * candidate.combinedScore - (1 - lambda) * maxSimilarity;
 
                 if (mmrScore > maxScore) {
@@ -715,7 +861,10 @@ export class VectorDB {
                 fullTextIndex: Array.from(nsData.fullTextIndex.entries()).map(
                     ([term, ids]) => [term, Array.from(ids)]
                 ),
-                indexedFields: nsData.indexedFields
+                indexedFields: nsData.indexedFields,
+                docLengths: Array.from(nsData.docLengths.entries()),
+                avgDocLength: nsData.avgDocLength,
+                totalDocs: nsData.totalDocs
             };
 
             await Promise.all([
@@ -741,15 +890,23 @@ export class VectorDB {
                 (data.fullTextIndex || []).map(([term, ids]: [string, number[]]) => [term, new Set(ids)])
             );
             nsData.indexedFields = data.indexedFields || [];
+            nsData.docLengths = new Map(data.docLengths || []);
+            nsData.avgDocLength = data.avgDocLength || 0;
+            nsData.totalDocs = data.totalDocs || 0;
         });
     }
 
-    private scheduleCompaction(): void {
-        setInterval(() => {
+    private scheduleCompaction(interval: number = 60 * 60 * 1000): void {
+        this.compactionIntervalId = setInterval(() => {
             this.namespaces.forEach((_, namespace) => {
                 this.compactNamespace(namespace);
             });
-        }, 60 * 60 * 1000);
+        }, interval);
+
+        // Allow the interval to not prevent process exit
+        if (this.compactionIntervalId.unref) {
+            this.compactionIntervalId.unref();
+        }
     }
 
     private compactNamespace(namespace: string): void {
@@ -763,6 +920,7 @@ export class VectorDB {
         const newIdMap: Record<string, number> = {};
         const newRevMap = new Map<number, { publicId: string; vector: number[]; metadata: Record<string, any> }>();
         const newFullTextIndex = new Map<string, Set<number>>();
+        const newDocLengths = new Map<number, number>();
 
         for (const [publicId, internalId] of Object.entries(nsData.idMap)) {
             const entry = nsData.revMap.get(internalId);
@@ -771,7 +929,10 @@ export class VectorDB {
                 newIdMap[publicId] = newNextId;
                 newRevMap.set(newNextId, entry);
 
-                // Reindex metadata for full-text search
+                // Reindex for full-text search
+                const docLength = this.calculateDocLength(entry.metadata, nsData.indexedFields);
+                newDocLengths.set(newNextId, docLength);
+
                 nsData.indexedFields.forEach(field => {
                     const value = entry.metadata[field];
                     if (typeof value === 'string') {
@@ -795,5 +956,9 @@ export class VectorDB {
         nsData.revMap = newRevMap;
         nsData.freeList = [];
         nsData.fullTextIndex = newFullTextIndex;
+        nsData.docLengths = newDocLengths;
+
+        // Recalculate BM25 stats
+        this.updateBM25Stats(nsData);
     }
 }

@@ -3,3 +3,4 @@ tsconfig.json
 .gitignore
 .DS_Store
 MYREADME.md
+examples/
